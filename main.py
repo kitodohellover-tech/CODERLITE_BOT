@@ -25,7 +25,6 @@ dp = Dispatcher()
 ALLOWED_IDS = [5264513480, 8834374199, 5389046699, 2083728480, 6612130539]
 
 db_pool = None
-HISTORY_LIMIT = 10
 MAX_AUTO_PARTS = 15
 CODE_EXTENSIONS = ["html", "py", "js", "css", "java", "cpp", "sql", "json"]
 
@@ -41,7 +40,6 @@ def detect_extension(text: str) -> str:
     return "txt"
 
 def clean_code(text: str) -> str:
-    """Чистит код от мусора, но НЕ рвёт строки."""
     text = text.replace("[file content end]", "").replace("[file content begin]", "")
     text = text.replace("// (продолжение следует)", "").replace("// (код готов)", "")
     text = text.replace("(продолжение следует)", "").replace("(код готов)", "")
@@ -53,7 +51,6 @@ def clean_code(text: str) -> str:
     return text.strip()
 
 def extract_code(answer: str) -> str:
-    """Извлекает ТОЛЬКО код, НЕ рвёт строки."""
     if "```" in answer:
         matches = re.findall(r'```(?:\w+)?\n(.*?)```', answer, re.DOTALL)
         if matches:
@@ -69,7 +66,6 @@ def extract_code(answer: str) -> str:
     return clean_code(answer)
 
 def finalize_code(code: str, ext: str) -> str:
-    """Добавляет закрывающие теги, если их нет."""
     if ext == "html":
         low = code.lower()
         if "</script>" not in low and "<script" in low:
@@ -81,7 +77,6 @@ def finalize_code(code: str, ext: str) -> str:
     return code
 
 def is_code_complete(answer: str) -> bool:
-    """Структурная проверка завершённости кода."""
     low = answer.lower()
     if "код готов" in low or "// (готово)" in low: return True
     if "продолжение следует" in low or "to be continued" in low: return False
@@ -90,19 +85,15 @@ def is_code_complete(answer: str) -> bool:
     return False
 
 def merge_code_parts(parts: list[str], ext: str) -> str:
-    """Умная склейка частей: убирает дубли тегов."""
     if not parts: return ""
     if ext != "html":
         return "\n\n".join(parts)
-    # Для HTML — умная склейка
     result = parts[0]
     for part in parts[1:]:
-        # Убираем дубли <!DOCTYPE>, <html>, <head>, <body>, <script> в начале
         part = re.sub(r'^<!DOCTYPE[^>]*>\s*', '', part)
         part = re.sub(r'^<html[^>]*>\s*', '', part)
         part = re.sub(r'^<head>.*?</head>\s*', '', part, flags=re.DOTALL)
         part = re.sub(r'^<body[^>]*>\s*', '', part)
-        # Убираем дубли <script> если уже открыт
         if "<script" in result and "</script>" not in result.split("<script")[-1]:
             part = re.sub(r'^<script[^>]*>\s*', '', part)
         result += "\n" + part
@@ -116,6 +107,9 @@ async def init_db():
             id SERIAL PRIMARY KEY, user_id BIGINT, project_id TEXT, part_num INT,
             content TEXT, topic TEXT, original_request TEXT, file_ext TEXT,
             status TEXT DEFAULT 'in_progress', created_at TIMESTAMP DEFAULT NOW())""")
+        # ДОБАВЛЯЕМ КОЛОНКИ, ЕСЛИ ИХ НЕТ (фикс старой таблицы от Лайта)
+        await c.execute("ALTER TABLE code_parts ADD COLUMN IF NOT EXISTS original_request TEXT")
+        await c.execute("ALTER TABLE code_parts ADD COLUMN IF NOT EXISTS file_ext TEXT")
 
 async def save_code_part(uid: int, pid: str, part: int, content: str, topic: str, original_request: str = "", file_ext: str = ""):
     async with db_pool.acquire() as c:
@@ -169,7 +163,7 @@ class AccessMiddleware(BaseMiddleware):
 dp.message.middleware(AccessMiddleware())
 
 
-# --- Промпт (короткий!) ---
+# --- Промпт (короткий) ---
 CODE_PROMPT = (
     "Ты — код-ассистент. Пишешь ТОЛЬКО чистый код, БЕЗ текста и пояснений. "
     "Пиши ЧАСТЯМИ по 800 токенов. НЕ разрывай строки кода на середине — "
@@ -181,19 +175,17 @@ CODE_PROMPT = (
 )
 
 
-# --- Автопромпт ---
+# --- Автопромпт (сокращённый, чтобы не превышать OTPM) ---
 async def improve_prompt(user_request: str) -> str:
     try:
         r = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[{"role": "user", "content":
-                f"Преобразуй запрос в чёткий промпт для генерации кода.\n"
-                f"Запрос: {user_request}\n\n"
-                f"Правила: укажи язык (если не указан — HTML/JS), "
-                f"что писать ТОЛЬКО код, частями по 800 токенов, "
-                f"с маркерами `// (продолжение следует)` / `// (код готов)`.\n"
+                f"Сделай краткий промпт для генерации кода по запросу: {user_request}\n"
+                f"Максимум 3 предложения. Укажи язык, что писать частями по 800 токенов, "
+                f"маркеры `// (продолжение следует)` / `// (код готов)`. "
                 f"Верни ТОЛЬКО промпт."}],
-            temperature=0.3, max_tokens=300
+            temperature=0.3, max_tokens=150
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
@@ -249,7 +241,7 @@ async def make_code(msg: types.Message, request: str):
                 f"Продолжи код. Уже написано (последние строки):\n\n"
                 f"```\n{old_code[-2500:]}\n```\n\n"
                 f"ПИШИ ТОЛЬКО КОД. НЕ начинай заново. НЕ повторяй. "
-                f"НЕ разрывай строки на середине. Закончи строку перед обрывом. "
+                f"НЕ разрывай строки на середине. "
                 f"Часть {next_part}. Максимум 800 токенов. "
                 f"В конце маркер: `// (продолжение следует)` или `// (код готов)`."
             )
@@ -275,7 +267,6 @@ async def make_code(msg: types.Message, request: str):
             await status.edit_text("❌ Пустой ответ. Попробуй ещё раз.")
             return
 
-        # Расширение
         prev_parts = await get_code_parts(uid, project_id)
         prev_full = "\n\n".join(prev_parts) if prev_parts else ""
         ext = detect_extension(prev_full + "\n" + code)
@@ -475,7 +466,6 @@ async def code_restart(cb: types.CallbackQuery):
 async def chat(msg: types.Message):
     uid = msg.from_user.id
 
-    # Голосовое
     if msg.voice:
         await bot.send_chat_action(msg.chat.id, "typing")
         try:
@@ -501,7 +491,6 @@ async def chat(msg: types.Message):
         await make_code(msg, text)
         return
 
-    # Документ (для доработки)
     if msg.document:
         fname = msg.document.file_name or "file"
         ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
@@ -546,7 +535,6 @@ async def chat(msg: types.Message):
             await msg.answer(f"❌ {str(e)[:200]}")
         return
 
-    # Текст
     if msg.text:
         low = msg.text.lower()
         code_triggers = ["напиши код", "сделай игру", "напиши игру", "сделай сайт",
@@ -555,7 +543,6 @@ async def chat(msg: types.Message):
         if any(w in low for w in code_triggers):
             await make_code(msg, msg.text)
             return
-        # Обычный текст — просто отвечаем что это код-бот
         await msg.answer(
             "💻 Я код-бот. Напиши что нужно сделать — сгенерирую код.\n"
             "Пример: `Сделай игру змейка на HTML`"
