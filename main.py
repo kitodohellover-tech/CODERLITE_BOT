@@ -107,7 +107,6 @@ async def init_db():
             id SERIAL PRIMARY KEY, user_id BIGINT, project_id TEXT, part_num INT,
             content TEXT, topic TEXT, original_request TEXT, file_ext TEXT,
             status TEXT DEFAULT 'in_progress', created_at TIMESTAMP DEFAULT NOW())""")
-        # ДОБАВЛЯЕМ КОЛОНКИ, ЕСЛИ ИХ НЕТ (фикс старой таблицы от Лайта)
         await c.execute("ALTER TABLE code_parts ADD COLUMN IF NOT EXISTS original_request TEXT")
         await c.execute("ALTER TABLE code_parts ADD COLUMN IF NOT EXISTS file_ext TEXT")
 
@@ -163,7 +162,7 @@ class AccessMiddleware(BaseMiddleware):
 dp.message.middleware(AccessMiddleware())
 
 
-# --- Промпт (короткий) ---
+# --- Промпт ---
 CODE_PROMPT = (
     "Ты — код-ассистент. Пишешь ТОЛЬКО чистый код, БЕЗ текста и пояснений. "
     "Пиши ЧАСТЯМИ по 800 токенов. НЕ разрывай строки кода на середине — "
@@ -175,7 +174,7 @@ CODE_PROMPT = (
 )
 
 
-# --- Автопромпт (сокращённый, чтобы не превышать OTPM) ---
+# --- Автопромпт ---
 async def improve_prompt(user_request: str) -> str:
     try:
         r = await client.chat.completions.create(
@@ -228,7 +227,6 @@ async def make_code(msg: types.Message, request: str):
 
         if not old_code:
             improved = await improve_prompt(request)
-            logging.info(f"[AUTOPROMPT] {request[:50]} → {improved[:100]}")
             original_request = request
         else:
             improved = None
@@ -403,14 +401,32 @@ async def continue_code(msg, uid: int, project_id: str):
         await status.edit_text(f"❌ {str(e)[:200]}")
 
 
+# --- LLM-детект намерения ---
+async def detect_code_intent(text: str) -> bool:
+    try:
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content":
+                f"Пользователь написал: «{text}»\n"
+                f"Хочет ли он написать код/игру/сайт/программу/бота? "
+                f"Ответь ТОЛЬКО 'да' или 'нет'."}],
+            temperature=0.1, max_tokens=5
+        )
+        return "да" in r.choices[0].message.content.strip().lower()
+    except Exception as e:
+        logging.error(f"[LLM-detect] {e}")
+        return False
+
+
 # --- Хендлеры ---
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     await msg.answer(
         "Привет. Я код-бот.\n\n"
         "💻 Напиши что нужно — сгенерирую код файлом.\n"
-        "🎤 Или отправь голосовое — распознаю и сделаю.\n\n"
-        "Пример: `Сделай игру змейка на HTML`"
+        "🎤 Или отправь голосовое — распознаю и сделаю.\n"
+        "📄 Скинь файл кода — доработаю.\n\n"
+        "Пример: `Сделай игру змейка на HTML с уровнями и скинами`"
     )
 
 @dp.message(Command("code"))
@@ -466,6 +482,7 @@ async def code_restart(cb: types.CallbackQuery):
 async def chat(msg: types.Message):
     uid = msg.from_user.id
 
+    # 1. Голосовое
     if msg.voice:
         await bot.send_chat_action(msg.chat.id, "typing")
         try:
@@ -477,6 +494,7 @@ async def chat(msg: types.Message):
         await make_code(msg, text)
         return
 
+    # 2. Аудио
     if msg.audio:
         await bot.send_chat_action(msg.chat.id, "typing")
         ext = "mp3"
@@ -491,6 +509,7 @@ async def chat(msg: types.Message):
         await make_code(msg, text)
         return
 
+    # 3. Документ с кодом
     if msg.document:
         fname = msg.document.file_name or "file"
         ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
@@ -535,17 +554,40 @@ async def chat(msg: types.Message):
             await msg.answer(f"❌ {str(e)[:200]}")
         return
 
+    # 4. Текст
     if msg.text:
         low = msg.text.lower()
-        code_triggers = ["напиши код", "сделай игру", "напиши игру", "сделай сайт",
-                        "напиши сайт", "создай игру", "сделай программу", "напиши программу",
-                        "создай сайт", "сделай змейку", "напиши змейку", "сделай бота"]
-        if any(w in low for w in code_triggers):
+
+        # 4.1. Триггеры продолжения
+        continue_triggers = ["допиши", "продолжи", "докончи", "дальше", "продолжай", "закончи"]
+        if any(w in low for w in continue_triggers):
+            active = await get_active_code(uid)
+            if active:
+                await continue_code(msg, uid, active['project_id'])
+            else:
+                await msg.answer("💻 Нет активного проекта. Напиши что сделать.")
+            return
+
+        # 4.2. Быстрые триггеры кода (расширенные)
+        fast_triggers = [
+            "код", "игр", "сайт", "бот", "программ", "скрипт", "приложен",
+            "html", "python", "js", "css", "java", "php", "sql",
+            "создай", "сделай", "напиши", "хочу", "нужно", "сделать",
+            "змейк", "динозавр", "тетрис", "арканоид", "2048", "flappy", "пятнашк"
+        ]
+        if any(w in low for w in fast_triggers):
             await make_code(msg, msg.text)
             return
+
+        # 4.3. LLM-детект (если не сработали триггеры)
+        if await detect_code_intent(msg.text):
+            await make_code(msg, msg.text)
+            return
+
+        # 4.4. Обычный ответ
         await msg.answer(
             "💻 Я код-бот. Напиши что нужно сделать — сгенерирую код.\n"
-            "Пример: `Сделай игру змейка на HTML`"
+            "Пример: `Сделай игру змейка на HTML с уровнями и скинами`"
         )
 
 
