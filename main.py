@@ -29,6 +29,27 @@ MAX_AUTO_PARTS = 15
 CODE_EXTENSIONS = ["html", "py", "js", "css", "java", "cpp", "sql", "json"]
 
 
+# === RETRY-ОБЁРТКА ДЛЯ GROQ ===
+async def call_groq_with_retry(messages, max_retries=3, max_tokens=1200, temperature=0.5):
+    """Вызов Groq с retry при 429 (Too Many Requests)."""
+    for attempt in range(max_retries):
+        try:
+            return await client.chat.completions.create(
+                model="qwen/qwen3.8-27b",
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+        except Exception as e:
+            err = str(e)
+            if "429" in err and attempt < max_retries - 1:
+                wait = 15 * (attempt + 1)  # 15, 30, 45 сек
+                logging.warning(f"[429] Жду {wait} сек (попытка {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait)
+            else:
+                raise
+
+
 # --- Утилиты ---
 def detect_extension(text: str) -> str:
     if "<!DOCTYPE html>" in text or "<html" in text.lower(): return "html"
@@ -177,14 +198,13 @@ CODE_PROMPT = (
 # --- Автопромпт ---
 async def improve_prompt(user_request: str) -> str:
     try:
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[{"role": "user", "content":
                 f"Сделай краткий промпт для генерации кода по запросу: {user_request}\n"
                 f"Максимум 3 предложения. Укажи язык, что писать частями по 800 токенов, "
                 f"маркеры `// (продолжение следует)` / `// (код готов)`. "
                 f"Верни ТОЛЬКО промпт."}],
-            temperature=0.3, max_tokens=150
+            max_tokens=150, temperature=0.3
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
@@ -251,13 +271,12 @@ async def make_code(msg: types.Message, request: str):
                 f"В конце маркер: `// (продолжение следует)` или `// (код готов)`."
             )
 
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[
                 {"role": "system", "content": CODE_PROMPT},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5, max_tokens=1200
+            max_tokens=1200, temperature=0.5
         )
         answer = r.choices[0].message.content
         code = extract_code(answer)
@@ -298,6 +317,10 @@ async def make_code(msg: types.Message, request: str):
 
 
 async def continue_code_auto(msg, uid: int, project_id: str, next_part: int, ext: str):
+    # ⏱ ПАУЗА между частями, чтобы не ловить 429
+    if next_part > 1:
+        await asyncio.sleep(10)
+    
     try:
         old_parts = await get_code_parts(uid, project_id)
         old_code = merge_code_parts(old_parts, ext)
@@ -311,13 +334,12 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int, ext
             f"Часть {next_part}. Максимум 800 токенов. "
             f"Маркер: `// (продолжение следует)` или `// (код готов)`."
         )
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[
                 {"role": "system", "content": CODE_PROMPT},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5, max_tokens=1200
+            max_tokens=1200, temperature=0.5
         )
         answer = r.choices[0].message.content
         code = extract_code(answer)
@@ -365,13 +387,12 @@ async def continue_code(msg, uid: int, project_id: str):
             f"Часть {next_part}. Максимум 800 токенов. "
             f"Маркер: `// (продолжение следует)` или `// (код готов)`."
         )
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[
                 {"role": "system", "content": CODE_PROMPT},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5, max_tokens=1200
+            max_tokens=1200, temperature=0.5
         )
         answer = r.choices[0].message.content
         code = extract_code(answer)
@@ -404,13 +425,12 @@ async def continue_code(msg, uid: int, project_id: str):
 # --- LLM-детект намерения ---
 async def detect_code_intent(text: str) -> bool:
     try:
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[{"role": "user", "content":
                 f"Пользователь написал: «{text}»\n"
                 f"Хочет ли он написать код/игру/сайт/программу/бота? "
                 f"Ответь ТОЛЬКО 'да' или 'нет'."}],
-            temperature=0.1, max_tokens=5
+            max_tokens=5, temperature=0.1
         )
         return "да" in r.choices[0].message.content.strip().lower()
     except Exception as e:
@@ -463,7 +483,7 @@ async def code_done(cb: types.CallbackQuery):
 async def code_auto(cb: types.CallbackQuery):
     pid = cb.data.replace("code_auto_", "")
     await cb.answer("⏩ Авто...")
-    await cb.message.answer("⏩ Авто-режим: дописываю до конца.")
+    await cb.message.answer("⏩ Авто-режим: дописываю до конца. Паузы между частями — 10 сек.")
     parts = await get_code_parts(cb.from_user.id, pid)
     meta = await get_code_meta(cb.from_user.id, pid)
     ext = meta.get('file_ext', 'html')
@@ -533,11 +553,10 @@ async def chat(msg: types.Message):
             f"НЕ разрывай строки. Маркер: `// (продолжение следует)` или `// (код готов)`."
         )
         try:
-            r = await client.chat.completions.create(
-                model="qwen/qwen3.8-27b",
+            r = await call_groq_with_retry(
                 messages=[{"role": "system", "content": CODE_PROMPT},
                           {"role": "user", "content": prompt}],
-                temperature=0.5, max_tokens=1200
+                max_tokens=1200, temperature=0.5
             )
             answer = r.choices[0].message.content
             new_code = extract_code(answer)
@@ -558,7 +577,6 @@ async def chat(msg: types.Message):
     if msg.text:
         low = msg.text.lower()
 
-        # 4.1. Триггеры продолжения
         continue_triggers = ["допиши", "продолжи", "докончи", "дальше", "продолжай", "закончи"]
         if any(w in low for w in continue_triggers):
             active = await get_active_code(uid)
@@ -568,7 +586,6 @@ async def chat(msg: types.Message):
                 await msg.answer("💻 Нет активного проекта. Напиши что сделать.")
             return
 
-        # 4.2. Быстрые триггеры кода (расширенные)
         fast_triggers = [
             "код", "игр", "сайт", "бот", "программ", "скрипт", "приложен",
             "html", "python", "js", "css", "java", "php", "sql",
@@ -579,12 +596,10 @@ async def chat(msg: types.Message):
             await make_code(msg, msg.text)
             return
 
-        # 4.3. LLM-детект (если не сработали триггеры)
         if await detect_code_intent(msg.text):
             await make_code(msg, msg.text)
             return
 
-        # 4.4. Обычный ответ
         await msg.answer(
             "💻 Я код-бот. Напиши что нужно сделать — сгенерирую код.\n"
             "Пример: `Сделай игру змейка на HTML с уровнями и скинами`"
