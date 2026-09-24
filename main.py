@@ -109,8 +109,10 @@ def merge_code_parts(parts: list[str], ext: str) -> str:
     if not parts: return ""
     if ext != "html":
         return "\n\n".join(parts)
+    
     result = parts[0]
     for part in parts[1:]:
+        # Чистим HTML-обёртки в последующих частях
         part = re.sub(r'^<!DOCTYPE[^>]*>\s*', '', part)
         part = re.sub(r'^<html[^>]*>\s*', '', part)
         part = re.sub(r'^<head>.*?</head>\s*', '', part, flags=re.DOTALL)
@@ -118,6 +120,28 @@ def merge_code_parts(parts: list[str], ext: str) -> str:
         if "<script" in result and "</script>" not in result.split("<script")[-1]:
             part = re.sub(r'^<script[^>]*>\s*', '', part)
         result += "\n" + part
+    
+    # Пост-обработка: закрываем незакрытые блоки
+    open_braces = result.count("{") - result.count("}")
+    open_parens = result.count("(") - result.count(")")
+    
+    if open_braces > 0:
+        logging.warning(f"[merge] Незакрытых {{ }}: {open_braces} — добавляю закрытия")
+        # Добавляем перед </script> или в конец
+        closure = "\n" + ("}" * open_braces)
+        if "</script>" in result:
+            result = result.replace("</script>", closure + "\n</script>", 1)
+        else:
+            result += closure
+    
+    if open_parens > 0:
+        logging.warning(f"[merge] Незакрытых ( ): {open_parens}")
+        closure = "\n" + (")" * open_parens)
+        if "</script>" in result:
+            result = result.replace("</script>", closure + "\n</script>", 1)
+        else:
+            result += closure
+    
     return result
 
 
