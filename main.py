@@ -92,19 +92,19 @@ def finalize_code(code: str, ext: str) -> str:
     """Финализация: закрывает теги, добавляет notranslate."""
     if ext == "html":
         low = code.lower()
-        # Закрываем незакрытые теги
-        if "</script>" not in low and "<script" in low:
-            code += "\n</script>"
-        if "</body>" not in low and "<body" in low:
-            code += "\n</body>"
-        if "</html>" not in low:
-            code += "\n</html>"
         # Запрет авто-перевода (Яндекс ломает JS)
-        if "<meta name=\"google\" content=\"notranslate\">" not in low:
+        if "notranslate" not in low:
             if "<head>" in low:
                 code = code.replace("<head>", '<head>\n<meta name="google" content="notranslate">', 1)
             elif "<html" in low:
                 code = re.sub(r'(<html[^>]*>)', r'\1\n<head>\n<meta name="google" content="notranslate">\n</head>', code, count=1)
+        # Закрываем незакрытые теги
+        if "</script>" not in code.lower() and "<script" in code.lower():
+            code += "\n</script>"
+        if "</body>" not in code.lower() and "<body" in code.lower():
+            code += "\n</body>"
+        if "</html>" not in code.lower():
+            code += "\n</html>"
     return code
 
 def is_code_complete(answer: str) -> bool:
@@ -113,69 +113,84 @@ def is_code_complete(answer: str) -> bool:
     if "продолжение следует" in low or "to be continued" in low: return False
     if "</html>" in low and "</script>" in low: return True
     if answer.count("```") >= 2 and "</html>" in answer: return True
-    # Баланс скобок
     if answer.count("{") == answer.count("}") and answer.count("(") == answer.count(")") and len(answer) > 2000:
         return True
     return False
 
 def merge_code_parts(parts: list[str], ext: str) -> str:
-    """Умная склейка частей с проверкой баланса."""
+    """Умная склейка с удалением дублей HTML-тегов и мусора."""
     if not parts: return ""
     if ext != "html":
         return "\n\n".join(parts)
-    
+
     result = parts[0]
+
     for part in parts[1:]:
-        # Убираем HTML-обёртки из последующих частей
-        part = re.sub(r'^<!DOCTYPE[^>]*>\s*', '', part)
-        part = re.sub(r'^<html[^>]*>\s*', '', part)
-        part = re.sub(r'^<head>.*?</head>\s*', '', part, flags=re.DOTALL)
-        part = re.sub(r'^<body[^>]*>\s*', '', part)
+        # === УДАЛЯЕМ ВСЕ HTML-ОБЁРТКИ ИЗ ЧАСТИ 2+ ===
+        part = re.sub(r'<!DOCTYPE[^>]*>', '', part, flags=re.IGNORECASE)
+        part = re.sub(r'<html[^>]*>', '', part, flags=re.IGNORECASE)
+        part = re.sub(r'</html>', '', part, flags=re.IGNORECASE)
+        part = re.sub(r'<head[^>]*>.*?</head>', '', part, flags=re.DOTALL | re.IGNORECASE)
+        part = re.sub(r'<body[^>]*>', '', part, flags=re.IGNORECASE)
+        part = re.sub(r'</body>', '', part, flags=re.IGNORECASE)
+        part = re.sub(r'<style[^>]*>.*?</style>', '', part, flags=re.DOTALL | re.IGNORECASE)
+        part = re.sub(r'<title[^>]*>.*?</title>', '', part, flags=re.DOTALL | re.IGNORECASE)
+
+        # Убираем повторные <script> и </script> если уже открыт скрипт
         if "<script" in result and "</script>" not in result.split("<script")[-1]:
-            part = re.sub(r'^<script[^>]*>\s*', '', part)
+            part = re.sub(r'<script[^>]*>', '', part, flags=re.IGNORECASE)
+        part = re.sub(r'</script>', '', part, flags=re.IGNORECASE)
+
+        # Убираем дублирующиеся ID-блоки
+        existing_ids = set(re.findall(r'id="([^"]+)"', result))
+        for m in re.finditer(r'<(\w+)[^>]*id="([^"]+)"[^>]*>.*?</\1>', part, flags=re.DOTALL):
+            if m.group(2) in existing_ids:
+                part = part.replace(m.group(0), '')
+
         result += "\n" + part
-    
-    # Проверка баланса фигурных скобок
-    open_braces = result.count("{") - result.count("}")
-    if open_braces > 0:
-        logging.warning(f"[merge] Незакрытых {{}}: {open_braces} — добавляю закрытия")
-        closure = "\n" + ("}" * open_braces)
-        if "</script>" in result:
-            result = result.replace("</script>", closure + "\n</script>", 1)
-        else:
-            result += closure
-    
-    # Проверка баланса круглых скобок
+
+    # === УБИРАЕМ МУСОР В КОНЦЕ (лишние } ) ] ) ===
+    result = re.sub(r'(\}\s*){3,}$', '}\n', result)
+    result = re.sub(r'(\)\s*){3,}$', ')\n', result)
+    result = re.sub(r'(\]\s*){3,}$', ']\n', result)
+
+    # === БАЛАНС ФИГУРНЫХ СКОБОК (только внутри <script>) ===
+    script_match = re.search(r'<script[^>]*>(.*?)</script>', result, re.DOTALL | re.IGNORECASE)
+    if script_match:
+        script = script_match.group(1)
+        open_braces = script.count("{") - script.count("}")
+        if open_braces > 0:
+            logging.warning(f"[merge] Незакрытых {{}}: {open_braces} в script")
+            closure = "\n" + ("}" * open_braces)
+            result = result.replace(script_match.group(0), script_match.group(0).replace("</script>", closure + "\n</script>"))
+
+    # === БАЛАНС КРУГЛЫХ СКОБОК ===
     open_parens = result.count("(") - result.count(")")
-    if open_parens > 0:
+    if open_parens > 3:
         logging.warning(f"[merge] Незакрытых ( ): {open_parens}")
         closure = "\n" + (")" * open_parens)
         if "</script>" in result:
             result = result.replace("</script>", closure + "\n</script>", 1)
-        else:
-            result += closure
-    
-    # Если JS висит без <script> — оборачиваем
+
+    # === ЕСЛИ JS БЕЗ <script> — ОБОРАЧИВАЕМ ===
     if "<script" not in result:
-        # Ищем закрывающий </div> главного контейнера
-        idx = result.rfind("</div>")
-        if idx > 0 and idx < len(result) - 50:
-            # Есть контент после последнего </div> — это JS
-            after = result[idx + 6:].strip()
-            if after and ("const " in after or "function " in after or "let " in after or "var " in after):
-                before = result[:idx + 6]
-                result = before + "\n<script>\n" + after + "\n</script>"
-    
-    # Проверка <script> и </script>
+        for tag in ["</div>", "</body>", "</html>"]:
+            idx = result.rfind(tag)
+            if idx > 0:
+                after = result[idx + len(tag):].strip()
+                if after and any(k in after for k in ["const ", "function ", "let ", "var ", "document."]):
+                    before = result[:idx + len(tag)]
+                    result = before + "\n<script>\n" + after + "\n</script>"
+                    break
+
+    # === ЗАКРЫТИЕ ТЕГОВ ===
     if "<script" in result and "</script>" not in result:
         result += "\n</script>"
-    
-    # Проверка </body> и </html>
     if "</body>" not in result:
         result += "\n</body>"
     if "</html>" not in result:
         result += "\n</html>"
-    
+
     return result
 
 # ============================================================
@@ -244,27 +259,31 @@ class AccessMiddleware(BaseMiddleware):
 dp.message.middleware(AccessMiddleware())
 
 # ============================================================
-# ПРОМПТ (УСИЛЕННЫЙ)
+# ПРОМПТ
 # ============================================================
 CODE_PROMPT = (
     "Ты — код-ассистент. Пишешь ТОЛЬКО чистый код, БЕЗ текста и пояснений. "
     "\n\n"
-    "КРИТИЧНО ВАЖНО:\n"
-    "1. НЕ обрывай строки кода на середине. Заканчивай ВСЕГДА на закрытой } или на пустой строке.\n"
+    "🚨 КРИТИЧНО — ТЫ ПИШЕШЬ ЧАСТЬ N ИЗ НЕСКОЛЬКИХ 🚨\n"
+    "Если N > 1:\n"
+    "- НЕ начинай с <!DOCTYPE html>, <html>, <head>, <body>, <style>, <script>\n"
+    "- ПРОДОЛЖАЙ РОВНО с того места, где закончилась предыдущая часть\n"
+    "- Если предыдущая часть кончилась на 'const canvas=...', ты начинаешь с 'const ctx=...'\n"
+    "- НЕ объявляй заново const/let/var/function/class, которые уже есть\n"
+    "- НЕ пиши повторно те же переменные (skins, levels, player, platforms)\n"
+    "\n"
+    "ПРАВИЛА КОДА:\n"
+    "1. НЕ обрывай строки кода на середине. Всегда заканчивай на закрытой } или на пустой строке.\n"
     "2. НЕ обрывай блоки { } — все должны быть закрыты до маркера.\n"
-    "3. НЕ обрывай строковые литералы ('...', \"...\", `...`) — закрывай их.\n"
-    "4. НЕ дублируй уже написанное (const/let/function/class). Если ты уже объявил переменную — НЕ объявляй снова.\n"
-    "5. Пиши плотно, без лишних пробелов и пустых строк.\n"
-    "6. Пиши БОЛЬШЕ за раз — до 1800 токенов (примерно 400-600 строк кода).\n"
-    "7. Если HTML — используй тег <script> для JS. Не пиши JS без <script>.\n"
+    "3. НЕ обрывай строковые литералы ('...', \"...\", `...`).\n"
+    "4. Пиши плотно, без лишних пробелов.\n"
+    "5. Пиши БОЛЬШЕ за раз — до 1800 токенов (400-600 строк).\n"
+    "6. Если это HTML — ВСЯ страница от <!DOCTYPE> до </html> пишется ТОЛЬКО в части 1. "
+    "В части 2+ — только продолжение кода внутри существующих <script>.\n"
     "\n"
     "В конце ОБЯЗАТЕЛЬНО маркер:\n"
     "`// (продолжение следует)` — если не закончил\n"
     "`// (код готов)` — если полностью закончил\n"
-    "\n"
-    "Если просят дописать — читай, что есть, продолжай с последней строки. "
-    "НЕ начинай заново. НЕ повторяй функции. "
-    "Если это HTML — пиши один файл от <!DOCTYPE> до </html>."
 )
 
 # ============================================================
@@ -332,11 +351,13 @@ async def make_code(msg: types.Message, request: str):
         if old_code:
             prompt = (
                 f"ОРИГИНАЛЬНЫЙ ЗАПРОС: {original_request}\n\n"
-                f"Продолжи код. Уже написано (последние строки):\n\n"
+                f"Ты пишешь ЧАСТЬ {next_part}. Уже написано (последние строки):\n\n"
                 f"```\n{old_code[-2500:]}\n```\n\n"
-                f"ПИШИ ТОЛЬКО КОД. НЕ начинай заново. НЕ повторяй. "
-                f"НЕ обрывай строки на середине. Все {{ }} должны быть закрыты. "
-                f"Часть {next_part}. Максимум 1800 токенов. "
+                f"ПРОДОЛЖИ РОВНО с последней строки. НЕ начинай заново! "
+                f"НЕ пиши <!DOCTYPE>, <html>, <head>, <body>, <style>, <script> снова. "
+                f"НЕ повторяй уже написанные const/let/function/class. "
+                f"ПИШИ ТОЛЬКО КОД. НЕ обрывай строки на середине. Все {{ }} закрывай. "
+                f"Максимум 1800 токенов. "
                 f"В конце маркер: `// (продолжение следует)` или `// (код готов)`."
             )
         else:
@@ -394,7 +415,6 @@ async def make_code(msg: types.Message, request: str):
 
 
 async def continue_code_auto(msg, uid: int, project_id: str, next_part: int, ext: str):
-    # Пауза 5 сек между частями (было 10)
     if next_part > 1:
         await asyncio.sleep(5)
     
@@ -406,10 +426,12 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int, ext
 
         prompt = (
             f"ОРИГИНАЛЬНЫЙ ЗАПРОС: {original_request}\n\n"
-            f"Продолжи код. Уже написано:\n\n```\n{old_code[-2500:]}\n```\n\n"
-            f"ПИШИ ТОЛЬКО КОД. НЕ повторяй. НЕ обрывай строки. "
-            f"Все {{ }} закрывай. НЕ дублируй const/let/function. "
-            f"Часть {next_part}. Максимум 1800 токенов. "
+            f"Ты пишешь ЧАСТЬ {next_part}. Уже написано:\n\n```\n{old_code[-2500:]}\n```\n\n"
+            f"ПРОДОЛЖИ РОВНО с последней строки. НЕ начинай заново! "
+            f"НЕ пиши <!DOCTYPE>, <html>, <head>, <body>, <style>, <script> снова. "
+            f"НЕ повторяй const/let/function/class. "
+            f"ПИШИ ТОЛЬКО КОД. НЕ обрывай строки. Все {{ }} закрывай. "
+            f"Максимум 1800 токенов. "
             f"Маркер: `// (продолжение следует)` или `// (код готов)`."
         )
         r = await call_groq_with_retry(
@@ -460,9 +482,12 @@ async def continue_code(msg, uid: int, project_id: str):
 
         prompt = (
             f"ОРИГИНАЛЬНЫЙ ЗАПРОС: {original_request}\n\n"
-            f"Продолжи код:\n\n```\n{old_code[-2500:]}\n```\n\n"
-            f"ПИШИ ТОЛЬКО КОД. НЕ повторяй. НЕ обрывай строки. "
-            f"Все {{ }} закрывай. Часть {next_part}. Максимум 1800 токенов. "
+            f"Ты пишешь ЧАСТЬ {next_part}. Уже написано:\n\n```\n{old_code[-2500:]}\n```\n\n"
+            f"ПРОДОЛЖИ РОВНО с последней строки. НЕ начинай заново! "
+            f"НЕ пиши <!DOCTYPE>, <html>, <head>, <body>, <style>, <script> снова. "
+            f"НЕ повторяй const/let/function/class. "
+            f"ПИШИ ТОЛЬКО КОД. НЕ обрывай строки. Все {{ }} закрывай. "
+            f"Максимум 1800 токенов. "
             f"Маркер: `// (продолжение следует)` или `// (код готов)`."
         )
         r = await call_groq_with_retry(
@@ -659,7 +684,6 @@ async def chat(msg: types.Message):
     if msg.text:
         low = msg.text.lower()
 
-        # 4.1. Триггеры продолжения
         continue_triggers = ["допиши", "продолжи", "докончи", "дальше", "продолжай", "закончи"]
         if any(w in low for w in continue_triggers):
             active = await get_active_code(uid)
@@ -669,7 +693,6 @@ async def chat(msg: types.Message):
                 await msg.answer("💻 Нет активного проекта. Напиши что сделать.")
             return
 
-        # 4.2. Быстрые триггеры
         fast_triggers = [
             "код", "игр", "сайт", "бот", "программ", "скрипт", "приложен",
             "html", "python", "js", "css", "java", "php", "sql",
@@ -680,12 +703,10 @@ async def chat(msg: types.Message):
             await make_code(msg, msg.text)
             return
 
-        # 4.3. LLM-детект
         if await detect_code_intent(msg.text):
             await make_code(msg, msg.text)
             return
 
-        # 4.4. Обычный ответ
         await msg.answer(
             "💻 Я код-бот. Напиши что нужно сделать — сгенерирую код.\n"
             "Пример: `Сделай игру змейка на HTML с уровнями и скинами`"
