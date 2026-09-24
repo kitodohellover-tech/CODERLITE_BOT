@@ -25,17 +25,18 @@ dp = Dispatcher()
 ALLOWED_IDS = [5264513480, 8834374199, 5389046699, 2083728480, 6612130539]
 
 db_pool = None
-MAX_AUTO_PARTS = 15
+MAX_AUTO_PARTS = 20
 CODE_EXTENSIONS = ["html", "py", "js", "css", "java", "cpp", "sql", "json"]
 
-
-# === RETRY-ОБЁРТКА ДЛЯ GROQ ===
-async def call_groq_with_retry(messages, max_retries=3, max_tokens=1200, temperature=0.5):
-    """Вызов Groq с retry при 429 (Too Many Requests)."""
+# ============================================================
+# RETRY ОБЁРТКА
+# ============================================================
+async def call_groq_with_retry(messages, max_retries=5, max_tokens=1800, temperature=0.5, model="qwen/qwen3.8-27b"):
+    """Вызов Groq с retry при 429."""
     for attempt in range(max_retries):
         try:
             return await client.chat.completions.create(
-                model="qwen/qwen3.8-27b",
+                model=model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens
@@ -43,14 +44,15 @@ async def call_groq_with_retry(messages, max_retries=3, max_tokens=1200, tempera
         except Exception as e:
             err = str(e)
             if "429" in err and attempt < max_retries - 1:
-                wait = 15 * (attempt + 1)  # 15, 30, 45 сек
+                wait = 20
                 logging.warning(f"[429] Жду {wait} сек (попытка {attempt+1}/{max_retries})")
                 await asyncio.sleep(wait)
             else:
                 raise
 
-
-# --- Утилиты ---
+# ============================================================
+# УТИЛИТЫ
+# ============================================================
 def detect_extension(text: str) -> str:
     if "<!DOCTYPE html>" in text or "<html" in text.lower(): return "html"
     if "def " in text and "import " in text: return "py"
@@ -87,14 +89,22 @@ def extract_code(answer: str) -> str:
     return clean_code(answer)
 
 def finalize_code(code: str, ext: str) -> str:
+    """Финализация: закрывает теги, добавляет notranslate."""
     if ext == "html":
         low = code.lower()
+        # Закрываем незакрытые теги
         if "</script>" not in low and "<script" in low:
             code += "\n</script>"
         if "</body>" not in low and "<body" in low:
             code += "\n</body>"
         if "</html>" not in low:
             code += "\n</html>"
+        # Запрет авто-перевода (Яндекс ломает JS)
+        if "<meta name=\"google\" content=\"notranslate\">" not in low:
+            if "<head>" in low:
+                code = code.replace("<head>", '<head>\n<meta name="google" content="notranslate">', 1)
+            elif "<html" in low:
+                code = re.sub(r'(<html[^>]*>)', r'\1\n<head>\n<meta name="google" content="notranslate">\n</head>', code, count=1)
     return code
 
 def is_code_complete(answer: str) -> bool:
@@ -103,16 +113,20 @@ def is_code_complete(answer: str) -> bool:
     if "продолжение следует" in low or "to be continued" in low: return False
     if "</html>" in low and "</script>" in low: return True
     if answer.count("```") >= 2 and "</html>" in answer: return True
+    # Баланс скобок
+    if answer.count("{") == answer.count("}") and answer.count("(") == answer.count(")") and len(answer) > 2000:
+        return True
     return False
 
 def merge_code_parts(parts: list[str], ext: str) -> str:
+    """Умная склейка частей с проверкой баланса."""
     if not parts: return ""
     if ext != "html":
         return "\n\n".join(parts)
     
     result = parts[0]
     for part in parts[1:]:
-        # Чистим HTML-обёртки в последующих частях
+        # Убираем HTML-обёртки из последующих частей
         part = re.sub(r'^<!DOCTYPE[^>]*>\s*', '', part)
         part = re.sub(r'^<html[^>]*>\s*', '', part)
         part = re.sub(r'^<head>.*?</head>\s*', '', part, flags=re.DOTALL)
@@ -121,19 +135,18 @@ def merge_code_parts(parts: list[str], ext: str) -> str:
             part = re.sub(r'^<script[^>]*>\s*', '', part)
         result += "\n" + part
     
-    # Пост-обработка: закрываем незакрытые блоки
+    # Проверка баланса фигурных скобок
     open_braces = result.count("{") - result.count("}")
-    open_parens = result.count("(") - result.count(")")
-    
     if open_braces > 0:
-        logging.warning(f"[merge] Незакрытых {{ }}: {open_braces} — добавляю закрытия")
-        # Добавляем перед </script> или в конец
+        logging.warning(f"[merge] Незакрытых {{}}: {open_braces} — добавляю закрытия")
         closure = "\n" + ("}" * open_braces)
         if "</script>" in result:
             result = result.replace("</script>", closure + "\n</script>", 1)
         else:
             result += closure
     
+    # Проверка баланса круглых скобок
+    open_parens = result.count("(") - result.count(")")
     if open_parens > 0:
         logging.warning(f"[merge] Незакрытых ( ): {open_parens}")
         closure = "\n" + (")" * open_parens)
@@ -142,10 +155,32 @@ def merge_code_parts(parts: list[str], ext: str) -> str:
         else:
             result += closure
     
+    # Если JS висит без <script> — оборачиваем
+    if "<script" not in result:
+        # Ищем закрывающий </div> главного контейнера
+        idx = result.rfind("</div>")
+        if idx > 0 and idx < len(result) - 50:
+            # Есть контент после последнего </div> — это JS
+            after = result[idx + 6:].strip()
+            if after and ("const " in after or "function " in after or "let " in after or "var " in after):
+                before = result[:idx + 6]
+                result = before + "\n<script>\n" + after + "\n</script>"
+    
+    # Проверка <script> и </script>
+    if "<script" in result and "</script>" not in result:
+        result += "\n</script>"
+    
+    # Проверка </body> и </html>
+    if "</body>" not in result:
+        result += "\n</body>"
+    if "</html>" not in result:
+        result += "\n</html>"
+    
     return result
 
-
-# --- БД ---
+# ============================================================
+# БД
+# ============================================================
 async def init_db():
     async with db_pool.acquire() as c:
         await c.execute("""CREATE TABLE IF NOT EXISTS code_parts (
@@ -185,8 +220,9 @@ async def delete_code(uid: int, pid: str):
     async with db_pool.acquire() as c:
         await c.execute("DELETE FROM code_parts WHERE user_id = $1 AND project_id = $2", uid, pid)
 
-
-# --- Whisper ---
+# ============================================================
+# WHISPER
+# ============================================================
 async def transcribe_audio(file_id: str, ext: str = "ogg") -> str:
     f = await bot.get_file(file_id)
     d = await bot.download_file(f.file_path)
@@ -196,8 +232,9 @@ async def transcribe_audio(file_id: str, ext: str = "ogg") -> str:
     )
     return t.text
 
-
-# --- Middleware ---
+# ============================================================
+# MIDDLEWARE
+# ============================================================
 class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if isinstance(event, types.Message):
@@ -206,19 +243,20 @@ class AccessMiddleware(BaseMiddleware):
 
 dp.message.middleware(AccessMiddleware())
 
-
-# --- Промпт ---
+# ============================================================
+# ПРОМПТ (УСИЛЕННЫЙ)
+# ============================================================
 CODE_PROMPT = (
     "Ты — код-ассистент. Пишешь ТОЛЬКО чистый код, БЕЗ текста и пояснений. "
-    "Пиши ЧАСТЯМИ по 800 токенов. "
     "\n\n"
-    "КРИТИЧНО ВАЖНО — КАК ЗАКАНЧИВАТЬ ЧАСТЬ:\n"
-    "- ВСЕ открытые фигурные скобки { } должны быть ЗАКРЫТЫ\n"
-    "- ВСЕ открытые круглые скобки ( ) должны быть ЗАКРЫТЫ\n"
-    "- Функции/классы дописывай ДО КОНЦА, не обрывай посередине\n"
-    "- НЕ обрывай массив или объект посередине\n"
-    "- Если места не хватает — закончи на пустой строке или на закрывающей }\n"
-    "- НЕ дублируй уже написанное: не начинай снова const/let/class если они уже есть\n"
+    "КРИТИЧНО ВАЖНО:\n"
+    "1. НЕ обрывай строки кода на середине. Заканчивай ВСЕГДА на закрытой } или на пустой строке.\n"
+    "2. НЕ обрывай блоки { } — все должны быть закрыты до маркера.\n"
+    "3. НЕ обрывай строковые литералы ('...', \"...\", `...`) — закрывай их.\n"
+    "4. НЕ дублируй уже написанное (const/let/function/class). Если ты уже объявил переменную — НЕ объявляй снова.\n"
+    "5. Пиши плотно, без лишних пробелов и пустых строк.\n"
+    "6. Пиши БОЛЬШЕ за раз — до 1800 токенов (примерно 400-600 строк кода).\n"
+    "7. Если HTML — используй тег <script> для JS. Не пиши JS без <script>.\n"
     "\n"
     "В конце ОБЯЗАТЕЛЬНО маркер:\n"
     "`// (продолжение следует)` — если не закончил\n"
@@ -229,25 +267,27 @@ CODE_PROMPT = (
     "Если это HTML — пиши один файл от <!DOCTYPE> до </html>."
 )
 
-
-# --- Автопромпт ---
+# ============================================================
+# АВТОПРОМПТ
+# ============================================================
 async def improve_prompt(user_request: str) -> str:
     try:
         r = await call_groq_with_retry(
             messages=[{"role": "user", "content":
                 f"Сделай краткий промпт для генерации кода по запросу: {user_request}\n"
-                f"Максимум 3 предложения. Укажи язык, что писать частями по 800 токенов, "
+                f"Максимум 3 предложения. Укажи язык, что писать частями, "
                 f"маркеры `// (продолжение следует)` / `// (код готов)`. "
                 f"Верни ТОЛЬКО промпт."}],
-            max_tokens=150, temperature=0.3
+            max_tokens=200, temperature=0.3
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
         logging.error(f"[improve_prompt] {e}")
         return user_request
 
-
-# --- Кнопки ---
+# ============================================================
+# КНОПКИ
+# ============================================================
 def code_keyboard(project_id: str, is_complete: bool = False, auto_mode: bool = False):
     if is_complete:
         return InlineKeyboardMarkup(inline_keyboard=[
@@ -264,8 +304,9 @@ def code_keyboard(project_id: str, is_complete: bool = False, auto_mode: bool = 
     buttons.append([InlineKeyboardButton(text="🔄 Начать заново", callback_data=f"code_restart_{project_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
-# --- Генерация кода ---
+# ============================================================
+# ГЕНЕРАЦИЯ КОДА
+# ============================================================
 async def make_code(msg: types.Message, request: str):
     uid = msg.from_user.id
     active = await get_active_code(uid)
@@ -294,15 +335,16 @@ async def make_code(msg: types.Message, request: str):
                 f"Продолжи код. Уже написано (последние строки):\n\n"
                 f"```\n{old_code[-2500:]}\n```\n\n"
                 f"ПИШИ ТОЛЬКО КОД. НЕ начинай заново. НЕ повторяй. "
-                f"НЕ разрывай строки на середине. "
-                f"Часть {next_part}. Максимум 800 токенов. "
+                f"НЕ обрывай строки на середине. Все {{ }} должны быть закрыты. "
+                f"Часть {next_part}. Максимум 1800 токенов. "
                 f"В конце маркер: `// (продолжение следует)` или `// (код готов)`."
             )
         else:
             prompt = (
                 f"{improved}\n\n"
-                f"ПИШИ ТОЛЬКО КОД. НЕ разрывай строки на середине. "
-                f"Максимум 800 токенов. "
+                f"ПИШИ ТОЛЬКО КОД. НЕ обрывай строки на середине. "
+                f"Все {{ }} закрывай. НЕ дублируй const/let/function. "
+                f"Максимум 1800 токенов за раз. "
                 f"В конце маркер: `// (продолжение следует)` или `// (код готов)`."
             )
 
@@ -311,7 +353,7 @@ async def make_code(msg: types.Message, request: str):
                 {"role": "system", "content": CODE_PROMPT},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=1200, temperature=0.5
+            max_tokens=1800, temperature=0.5
         )
         answer = r.choices[0].message.content
         code = extract_code(answer)
@@ -352,9 +394,9 @@ async def make_code(msg: types.Message, request: str):
 
 
 async def continue_code_auto(msg, uid: int, project_id: str, next_part: int, ext: str):
-    # ⏱ ПАУЗА между частями, чтобы не ловить 429
+    # Пауза 5 сек между частями (было 10)
     if next_part > 1:
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
     
     try:
         old_parts = await get_code_parts(uid, project_id)
@@ -365,8 +407,9 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int, ext
         prompt = (
             f"ОРИГИНАЛЬНЫЙ ЗАПРОС: {original_request}\n\n"
             f"Продолжи код. Уже написано:\n\n```\n{old_code[-2500:]}\n```\n\n"
-            f"ПИШИ ТОЛЬКО КОД. НЕ повторяй. НЕ разрывай строки. "
-            f"Часть {next_part}. Максимум 800 токенов. "
+            f"ПИШИ ТОЛЬКО КОД. НЕ повторяй. НЕ обрывай строки. "
+            f"Все {{ }} закрывай. НЕ дублируй const/let/function. "
+            f"Часть {next_part}. Максимум 1800 токенов. "
             f"Маркер: `// (продолжение следует)` или `// (код готов)`."
         )
         r = await call_groq_with_retry(
@@ -374,7 +417,7 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int, ext
                 {"role": "system", "content": CODE_PROMPT},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=1200, temperature=0.5
+            max_tokens=1800, temperature=0.5
         )
         answer = r.choices[0].message.content
         code = extract_code(answer)
@@ -418,8 +461,8 @@ async def continue_code(msg, uid: int, project_id: str):
         prompt = (
             f"ОРИГИНАЛЬНЫЙ ЗАПРОС: {original_request}\n\n"
             f"Продолжи код:\n\n```\n{old_code[-2500:]}\n```\n\n"
-            f"ПИШИ ТОЛЬКО КОД. НЕ повторяй. НЕ разрывай строки. "
-            f"Часть {next_part}. Максимум 800 токенов. "
+            f"ПИШИ ТОЛЬКО КОД. НЕ повторяй. НЕ обрывай строки. "
+            f"Все {{ }} закрывай. Часть {next_part}. Максимум 1800 токенов. "
             f"Маркер: `// (продолжение следует)` или `// (код готов)`."
         )
         r = await call_groq_with_retry(
@@ -427,7 +470,7 @@ async def continue_code(msg, uid: int, project_id: str):
                 {"role": "system", "content": CODE_PROMPT},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=1200, temperature=0.5
+            max_tokens=1800, temperature=0.5
         )
         answer = r.choices[0].message.content
         code = extract_code(answer)
@@ -456,8 +499,9 @@ async def continue_code(msg, uid: int, project_id: str):
         logging.error(f"continue error: {e}")
         await status.edit_text(f"❌ {str(e)[:200]}")
 
-
-# --- LLM-детект намерения ---
+# ============================================================
+# LLM-ДЕТЕКТ
+# ============================================================
 async def detect_code_intent(text: str) -> bool:
     try:
         r = await call_groq_with_retry(
@@ -472,8 +516,9 @@ async def detect_code_intent(text: str) -> bool:
         logging.error(f"[LLM-detect] {e}")
         return False
 
-
-# --- Хендлеры ---
+# ============================================================
+# ХЕНДЛЕРЫ
+# ============================================================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     await msg.answer(
@@ -518,7 +563,7 @@ async def code_done(cb: types.CallbackQuery):
 async def code_auto(cb: types.CallbackQuery):
     pid = cb.data.replace("code_auto_", "")
     await cb.answer("⏩ Авто...")
-    await cb.message.answer("⏩ Авто-режим: дописываю до конца. Паузы между частями — 10 сек.")
+    await cb.message.answer("⏩ Авто-режим: дописываю до конца. Паузы между частями — 5 сек.")
     parts = await get_code_parts(cb.from_user.id, pid)
     meta = await get_code_meta(cb.from_user.id, pid)
     ext = meta.get('file_ext', 'html')
@@ -531,8 +576,9 @@ async def code_restart(cb: types.CallbackQuery):
     await delete_code(cb.from_user.id, pid)
     await cb.message.answer("🔄 Заново. Напиши, что нужно.")
 
-
-# --- Основной обработчик ---
+# ============================================================
+# ОСНОВНОЙ ОБРАБОТЧИК
+# ============================================================
 @dp.message()
 async def chat(msg: types.Message):
     uid = msg.from_user.id
@@ -585,13 +631,14 @@ async def chat(msg: types.Message):
             f"ОРИГИНАЛЬНЫЙ ЗАПРОС: {msg.caption or 'Доработай код'}\n\n"
             f"Вот код:\n\n```\n{old_code[-2500:]}\n```\n\n"
             f"Доработай или дополни. ПИШИ ТОЛЬКО КОД. "
-            f"НЕ разрывай строки. Маркер: `// (продолжение следует)` или `// (код готов)`."
+            f"НЕ обрывай строки. Все {{ }} закрывай. "
+            f"Маркер: `// (продолжение следует)` или `// (код готов)`."
         )
         try:
             r = await call_groq_with_retry(
                 messages=[{"role": "system", "content": CODE_PROMPT},
                           {"role": "user", "content": prompt}],
-                max_tokens=1200, temperature=0.5
+                max_tokens=1800, temperature=0.5
             )
             answer = r.choices[0].message.content
             new_code = extract_code(answer)
@@ -612,6 +659,7 @@ async def chat(msg: types.Message):
     if msg.text:
         low = msg.text.lower()
 
+        # 4.1. Триггеры продолжения
         continue_triggers = ["допиши", "продолжи", "докончи", "дальше", "продолжай", "закончи"]
         if any(w in low for w in continue_triggers):
             active = await get_active_code(uid)
@@ -621,6 +669,7 @@ async def chat(msg: types.Message):
                 await msg.answer("💻 Нет активного проекта. Напиши что сделать.")
             return
 
+        # 4.2. Быстрые триггеры
         fast_triggers = [
             "код", "игр", "сайт", "бот", "программ", "скрипт", "приложен",
             "html", "python", "js", "css", "java", "php", "sql",
@@ -631,17 +680,20 @@ async def chat(msg: types.Message):
             await make_code(msg, msg.text)
             return
 
+        # 4.3. LLM-детект
         if await detect_code_intent(msg.text):
             await make_code(msg, msg.text)
             return
 
+        # 4.4. Обычный ответ
         await msg.answer(
             "💻 Я код-бот. Напиши что нужно сделать — сгенерирую код.\n"
             "Пример: `Сделай игру змейка на HTML с уровнями и скинами`"
         )
 
-
-# --- Веб-сервер ---
+# ============================================================
+# ВЕБ-СЕРВЕР
+# ============================================================
 async def handle(request):
     return web.Response(text="CodeBot is running!")
 
